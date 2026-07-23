@@ -1,0 +1,7 @@
+*.ccache
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+.DS_Store
