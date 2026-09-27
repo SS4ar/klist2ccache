@@ -732,6 +732,16 @@ def _add_remote_args(parser):
         help="WinRM port (default: 5985 for HTTP or 5986 for HTTPS)",
     )
     connection.add_argument("-ssl", action="store_true", help="Use WinRM over HTTPS")
+    connection.add_argument(
+        "--krb-service",
+        default=None,
+        help="Kerberos SPN service class with -k (default: HTTP; e.g. WSMAN)",
+    )
+    connection.add_argument(
+        "--krb-hostname",
+        default=None,
+        help="Kerberos SPN hostname override with -k (for tunnels/jump hosts)",
+    )
 
     session_filter = parser.add_mutually_exclusive_group()
     session_filter.add_argument(
@@ -841,6 +851,93 @@ def _connect_smb(args, domain, username, password, address, lmhash, nthash):
     return dce, rpctransport.get_smb_connection()
 
 
+def _krb5_realm_domain(domain, address):
+    """Best-effort (REALM, dns-domain) pair from the parsed target."""
+    dns_domain = domain or (
+        ".".join(address.split(".")[1:]) if address.count(".") >= 2 else ""
+    )
+    return (dns_domain.upper(), dns_domain.lower()) if dns_domain else ("", "")
+
+
+def _setup_krb5_conf(domain, address):
+    """Write a managed krb5.conf snippet and prepend it to KRB5_CONFIG.
+
+    This removes the need for a system krb5.conf: without it MIT krb5 refuses
+    realm-less principals and canonicalises SPN hostnames through reverse DNS,
+    which breaks tickets minted for a specific SPN.
+    """
+    realm, dns_domain = _krb5_realm_domain(domain, address)
+    if not dns_domain:
+        return
+    conf_dir = os.path.expanduser("~/.config/klist2ccache")
+    conf_path = os.path.join(conf_dir, "krb5.conf")
+    content = (
+        "[libdefaults]\n"
+        "    default_realm = %s\n"
+        "    rdns = false\n"
+        "    dns_canonicalize_hostname = false\n"
+        "\n"
+        "[domain_realm]\n"
+        "    .%s = %s\n"
+        "    %s = %s\n" % (
+            realm, dns_domain, realm, dns_domain, realm,
+        )
+    )
+    try:
+        os.makedirs(conf_dir, exist_ok=True)
+        with open(conf_path, "w") as f:
+            f.write(content)
+    except OSError as exc:
+        logging.debug("Could not write managed krb5.conf: %s" % exc)
+        return
+    existing = os.environ.get("KRB5_CONFIG", "/etc/krb5.conf")
+    if conf_path not in existing.split(":"):
+        os.environ["KRB5_CONFIG"] = conf_path + ":" + existing
+
+
+def _normalize_ccache_hostname(spn_host):
+    """krb5 lowercases the hostname part of the SPN before looking it up in the
+    ccache, and the lookup is case-sensitive. Rewrite any case variant of the
+    hostname inside the ccache file so the ticket always matches. Case-only
+    replacement keeps the byte length, so the length-prefixed ccache stays valid."""
+    ccache = os.environ.get("KRB5CCNAME", "")
+    if not ccache or not spn_host:
+        return
+    if ccache.upper().startswith("FILE:"):
+        ccache = ccache[5:]
+    if "://" in ccache or ccache.upper().startswith("DIR:"):
+        return
+    path = os.path.expanduser(ccache)
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        pattern = re.compile(re.escape(spn_host.encode()), re.IGNORECASE)
+        fixed = pattern.sub(spn_host.lower().encode(), data)
+        if fixed != data:
+            with open(path, "wb") as f:
+                f.write(fixed)
+            logging.info("Normalized SPN host case in %s -> %s" % (path, spn_host.lower()))
+    except OSError:
+        pass
+
+
+def _normalize_krb_principal(domain, username, address):
+    """Build a fully qualified client principal (user@REALM) for pywinrm.
+
+    DOMAIN\\user and realm-less principals make the GSSAPI library depend on
+    default_realm from krb5.conf; with the realm appended explicitly it does not.
+    """
+    if "@" in username:
+        user, _, realm = username.partition("@")
+        return "%s@%s" % (user, realm.upper())
+    realm, _ = _krb5_realm_domain(domain, address)
+    if realm:
+        return "%s@%s" % (username, realm)
+    return username
+
+
 def _connect_winrm(args, domain, username, password, address, lmhash, nthash):
     try:
         import winrm
@@ -857,20 +954,27 @@ def _connect_winrm(args, domain, username, password, address, lmhash, nthash):
         address,
         port,
     )
-    user = "%s\\%s" % (domain, username) if domain else username
-
+    krb_kwargs = {}
     if args.k:
         winrm_transport = "kerberos"
         passwd = password or ""
-    elif nthash:
-        winrm_transport = "ntlm"
-        passwd = "%s:%s" % (
-            lmhash or "00000000000000000000000000000000",
-            nthash,
-        )
+        user = _normalize_krb_principal(domain, username, address)
+        _setup_krb5_conf(domain, address)
+        _normalize_ccache_hostname(args.krb_hostname or address)
+        krb_kwargs["service"] = args.krb_service or "HTTP"
+        if args.krb_hostname:
+            krb_kwargs["kerberos_hostname_override"] = args.krb_hostname
     else:
-        winrm_transport = "ntlm"
-        passwd = password
+        user = "%s\\%s" % (domain, username) if domain else username
+        if nthash:
+            winrm_transport = "ntlm"
+            passwd = "%s:%s" % (
+                lmhash or "00000000000000000000000000000000",
+                nthash,
+            )
+        else:
+            winrm_transport = "ntlm"
+            passwd = password
 
     logging.info("Connecting to %s (%s transport) ..." % (endpoint, winrm_transport))
     try:
@@ -879,6 +983,8 @@ def _connect_winrm(args, domain, username, password, address, lmhash, nthash):
             auth=(user, passwd),
             transport=winrm_transport,
             server_cert_validation="ignore",
+            message_encryption="auto",
+            **krb_kwargs,
         )
         response = session.run_cmd("echo", ["ok"])
         if response.status_code != 0:
